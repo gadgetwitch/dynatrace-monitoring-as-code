@@ -17,16 +17,16 @@ import (
 )
 
 func Deploy(workingDir string, fileReader util.FileReader, environmentsFile string,
-	specificEnvironment string, proj string, dryRun bool) error {
+	specificEnvironment string, proj string, dryRun bool, continueOnError bool) error {
 	environments, errors := environment.LoadEnvironmentList(specificEnvironment, environmentsFile, fileReader)
 
 	workingDir = filepath.Clean(workingDir)
 
-	var deploymentErrors = make(map[string]error)
+	var deploymentErrors = make(map[string][]error)
 
 	for i, err := range errors {
 		configIssue := fmt.Sprintf("environmentfile-issue-%d", i)
-		deploymentErrors[configIssue] = err
+		deploymentErrors[configIssue] = append(deploymentErrors[configIssue], err)
 	}
 
 	apis := api.NewApis()
@@ -43,21 +43,35 @@ func Deploy(workingDir string, fileReader util.FileReader, environmentsFile stri
 	}
 
 	for _, environment := range environments {
-		err := execute(environment, projects, dryRun, workingDir)
-		if err != nil {
-			deploymentErrors[environment.GetId()] = err
+		errors := execute(environment, projects, dryRun, workingDir, continueOnError)
+		if errors != nil {
+			deploymentErrors[environment.GetId()] = errors
 		}
 	}
 
 	for environment, err := range deploymentErrors {
 		if dryRun {
 			util.Log.Error("Validation of %s failed with error %s\n", environment, err)
-			util.PrettyPrintError(err)
+			for _, envError := range err {
+				util.PrettyPrintError(envError)
+			}
+		} else if continueOnError {
+			util.Log.Error("Deployment to %s finished with following errors:\n", environment)
+			for nr, envError := range err {
+				util.Log.Error("\t%b: %s", nr, envError)
+			}
 		} else {
-			util.Log.Error("Deployment to %s failed with error %s\n", environment, err)
+			util.Log.Error("Deployment to %s failed with error %s\n", environment, err[0])
 		}
+	}
 
-		return fmt.Errorf("Errors during deployment! Check log!")
+	// do not execute delete if there are any problems with deployment
+	if len(deploymentErrors) > 0 {
+		if dryRun {
+			return fmt.Errorf("Errors during validation! Check log!")
+		} else {
+			return fmt.Errorf("Errors during deployment! Check log!")
+		}
 	}
 
 	if dryRun {
@@ -71,19 +85,19 @@ func Deploy(workingDir string, fileReader util.FileReader, environmentsFile stri
 	return nil
 }
 
-func execute(environment environment.Environment, projects []project.Project, dryRun bool, path string) error {
+func execute(environment environment.Environment, projects []project.Project, dryRun bool, path string, continueOnError bool) (errors []error) {
 	util.Log.Info("Processing environment " + environment.GetId() + "...")
 
 	var client rest.DynatraceClient
 	if !dryRun {
 		apiToken, err := environment.GetToken()
 		if err != nil {
-			return err
+			return append(errors, err)
 		}
 
 		client, err = rest.NewDynatraceClient(environment.GetEnvironmentUrl(), apiToken)
 		if err != nil {
-			return err
+			return append(errors, err)
 		}
 	}
 
@@ -111,12 +125,12 @@ func execute(environment environment.Environment, projects []project.Project, dr
 
 			name, err = config.GetObjectNameForEnvironment(environment, dict)
 			if err != nil {
-				return err
+				return append(errors, err)
 			}
 			name = config.GetApi().GetId() + "/" + name
 			configID = config.GetFullQualifiedId()
 			if nameDict[name] != "" {
-				return fmt.Errorf("duplicate UID '%s' found in %s and %s", name, configID, nameDict[name])
+				return append(errors, fmt.Errorf("duplicate UID '%s' found in %s and %s", name, configID, nameDict[name]))
 			}
 			nameDict[name] = configID
 
@@ -127,7 +141,12 @@ func execute(environment environment.Environment, projects []project.Project, dr
 			}
 
 			if err != nil {
-				return err
+				// by default stop deployment on error
+				if !continueOnError && !dryRun {
+					return append(errors, err)
+				} else {
+					errors = append(errors, err)
+				}
 			}
 
 			referenceId := strings.TrimPrefix(config.GetFullQualifiedId(), path+"/")
@@ -137,6 +156,11 @@ func execute(environment environment.Environment, projects []project.Project, dr
 			}
 		}
 	}
+
+	if errors != nil {
+		return errors
+	}
+
 	return nil
 }
 
